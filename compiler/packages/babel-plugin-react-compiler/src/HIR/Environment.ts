@@ -47,7 +47,7 @@ import {
   ShapeRegistry,
   addHook,
 } from './ObjectShape';
-import {Scope as BabelScope} from '@babel/traverse';
+import {Scope as BabelScope, NodePath} from '@babel/traverse';
 import {TypeSchema} from './TypeSchema';
 
 export const ReactElementSymbolSchema = z.object({
@@ -244,6 +244,11 @@ export const EnvironmentConfigSchema = z.object({
   enableUseTypeAnnotations: z.boolean().default(false),
 
   /**
+   * Enable a new model for mutability and aliasing inference
+   */
+  enableNewMutationAliasingModel: z.boolean().default(true),
+
+  /**
    * Enables inference of optional dependency chains. Without this flag
    * a property chain such as `props?.items?.foo` will infer as a dep on
    * just `props`. With this flag enabled, we'll infer that full path as
@@ -260,21 +265,19 @@ export const EnvironmentConfigSchema = z.object({
    *   {
    *     module: 'react',
    *     imported: 'useEffect',
-   *     numRequiredArgs: 1,
+   *     autodepsIndex: 1,
    *   },{
    *     module: 'MyExperimentalEffectHooks',
    *     imported: 'useExperimentalEffect',
-   *     numRequiredArgs: 2,
+   *     autodepsIndex: 2,
    *   },
    * ]
    * would insert dependencies for calls of `useEffect` imported from `react` and calls of
    * useExperimentalEffect` from `MyExperimentalEffectHooks`.
    *
-   * `numRequiredArgs` tells the compiler the amount of arguments required to append a dependency
-   *  array to the end of the call. With the configuration above, we'd insert dependencies for
-   *  `useEffect` if it is only given a single argument and it would be appended to the argument list.
-   *
-   * numRequiredArgs must always be greater than 0, otherwise there is no function to analyze for dependencies
+   * `autodepsIndex` tells the compiler which index we expect the AUTODEPS to appear in.
+   *  With the configuration above, we'd insert dependencies for `useEffect` if it has two
+   *  arguments, and the second is AUTODEPS.
    *
    * Still experimental.
    */
@@ -283,7 +286,7 @@ export const EnvironmentConfigSchema = z.object({
       z.array(
         z.object({
           function: ExternalFunctionSchema,
-          numRequiredArgs: z.number().min(1, 'numRequiredArgs must be > 0'),
+          autodepsIndex: z.number().min(1, 'autodepsIndex must be > 0'),
         }),
       ),
     )
@@ -315,10 +318,10 @@ export const EnvironmentConfigSchema = z.object({
   validateNoSetStateInRender: z.boolean().default(true),
 
   /**
-   * Validates that setState is not called directly within a passive effect (useEffect).
+   * Validates that setState is not called synchronously within an effect (useEffect and friends).
    * Scheduling a setState (with an event listener, subscription, etc) is valid.
    */
-  validateNoSetStateInPassiveEffects: z.boolean().default(false),
+  validateNoSetStateInEffects: z.boolean().default(false),
 
   /**
    * Validates against creating JSX within a try block and recommends using an error boundary
@@ -605,7 +608,7 @@ export const EnvironmentConfigSchema = z.object({
    *
    * Here the variables `ref` and `myRef` will be typed as Refs.
    */
-  enableTreatRefLikeIdentifiersAsRefs: z.boolean().default(false),
+  enableTreatRefLikeIdentifiersAsRefs: z.boolean().default(true),
 
   /*
    * If specified a value, the compiler lowers any calls to `useContext` to use
@@ -628,6 +631,17 @@ export const EnvironmentConfigSchema = z.object({
    * ```
    */
   lowerContextAccess: ExternalFunctionSchema.nullable().default(null),
+
+  /**
+   * If enabled, will validate useMemos that don't return any values:
+   *
+   * Valid:
+   *   useMemo(() => foo, [foo]);
+   *   useMemo(() => { return foo }, [foo]);
+   * Invalid:
+   *   useMemo(() => { ... }, [...]);
+   */
+  validateNoVoidUseMemo: z.boolean().default(false),
 });
 
 export type EnvironmentConfig = z.infer<typeof EnvironmentConfigSchema>;
@@ -675,6 +689,7 @@ export class Environment {
 
   #contextIdentifiers: Set<t.Identifier>;
   #hoistedIdentifiers: Set<t.Identifier>;
+  parentFunction: NodePath<t.Function>;
 
   constructor(
     scope: BabelScope,
@@ -682,6 +697,7 @@ export class Environment {
     compilerMode: CompilerMode,
     config: EnvironmentConfig,
     contextIdentifiers: Set<t.Identifier>,
+    parentFunction: NodePath<t.Function>, // the outermost function being compiled
     logger: Logger | null,
     filename: string | null,
     code: string | null,
@@ -740,6 +756,7 @@ export class Environment {
       this.#moduleTypes.set(REANIMATED_MODULE_NAME, reanimatedModuleType);
     }
 
+    this.parentFunction = parentFunction;
     this.#contextIdentifiers = contextIdentifiers;
     this.#hoistedIdentifiers = new Set();
   }
