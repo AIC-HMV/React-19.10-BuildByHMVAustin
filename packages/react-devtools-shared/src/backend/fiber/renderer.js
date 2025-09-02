@@ -7,7 +7,11 @@
  * @flow
  */
 
-import type {ReactComponentInfo, ReactDebugInfo} from 'shared/ReactTypes';
+import type {
+  ReactComponentInfo,
+  ReactDebugInfo,
+  ReactAsyncInfo,
+} from 'shared/ReactTypes';
 
 import {
   ComponentFilterDisplayName,
@@ -101,6 +105,8 @@ import {componentInfoToComponentLogsMap} from '../shared/DevToolsServerComponent
 import is from 'shared/objectIs';
 import hasOwnProperty from 'shared/hasOwnProperty';
 
+import {getIODescription} from 'shared/ReactIODescription';
+
 import {
   getStackByFiberInDevAndProd,
   getOwnerStackByFiberInDev,
@@ -135,6 +141,7 @@ import type {
   ReactRenderer,
   RendererInterface,
   SerializedElement,
+  SerializedAsyncInfo,
   WorkTagMap,
   CurrentDispatcherRef,
   LegacyDispatcherRef,
@@ -145,7 +152,7 @@ import type {
   ElementType,
   Plugins,
 } from 'react-devtools-shared/src/frontend/types';
-import type {Source} from 'react-devtools-shared/src/shared/types';
+import type {ReactFunctionLocation} from 'shared/ReactTypes';
 import {getSourceLocationByFiber} from './DevToolsFiberComponentStack';
 import {formatOwnerStack} from '../shared/DevToolsOwnerStack';
 
@@ -162,9 +169,10 @@ type FiberInstance = {
   parent: null | DevToolsInstance,
   firstChild: null | DevToolsInstance,
   nextSibling: null | DevToolsInstance,
-  source: null | string | Error | Source, // source location of this component function, or owned child stack
+  source: null | string | Error | ReactFunctionLocation, // source location of this component function, or owned child stack
   logCount: number, // total number of errors/warnings last seen
   treeBaseDuration: number, // the profiled time of the last render of this subtree
+  suspendedBy: null | Array<ReactAsyncInfo>, // things that suspended in the children position of this component
   data: Fiber, // one of a Fiber pair
 };
 
@@ -178,6 +186,7 @@ function createFiberInstance(fiber: Fiber): FiberInstance {
     source: null,
     logCount: 0,
     treeBaseDuration: 0,
+    suspendedBy: null,
     data: fiber,
   };
 }
@@ -190,9 +199,10 @@ type FilteredFiberInstance = {
   parent: null | DevToolsInstance,
   firstChild: null | DevToolsInstance,
   nextSibling: null | DevToolsInstance,
-  source: null | string | Error | Source, // always null here.
+  source: null | string | Error | ReactFunctionLocation, // always null here.
   logCount: number, // total number of errors/warnings last seen
   treeBaseDuration: number, // the profiled time of the last render of this subtree
+  suspendedBy: null | Array<ReactAsyncInfo>, // not used
   data: Fiber, // one of a Fiber pair
 };
 
@@ -207,6 +217,7 @@ function createFilteredFiberInstance(fiber: Fiber): FilteredFiberInstance {
     source: null,
     logCount: 0,
     treeBaseDuration: 0,
+    suspendedBy: null,
     data: fiber,
   }: any);
 }
@@ -222,9 +233,10 @@ type VirtualInstance = {
   parent: null | DevToolsInstance,
   firstChild: null | DevToolsInstance,
   nextSibling: null | DevToolsInstance,
-  source: null | string | Error | Source, // source location of this server component, or owned child stack
+  source: null | string | Error | ReactFunctionLocation, // source location of this server component, or owned child stack
   logCount: number, // total number of errors/warnings last seen
   treeBaseDuration: number, // the profiled time of the last render of this subtree
+  suspendedBy: null | Array<ReactAsyncInfo>, // things that blocked the server component's child from rendering
   // The latest info for this instance. This can be updated over time and the
   // same info can appear in more than once ServerComponentInstance.
   data: ReactComponentInfo,
@@ -242,6 +254,7 @@ function createVirtualInstance(
     source: null,
     logCount: 0,
     treeBaseDuration: 0,
+    suspendedBy: null,
     data: debugEntry,
   };
 }
@@ -2354,6 +2367,21 @@ export function attach(
   // the current parent here as well.
   let reconcilingParent: null | DevToolsInstance = null;
 
+  function insertSuspendedBy(asyncInfo: ReactAsyncInfo): void {
+    const parentInstance = reconcilingParent;
+    if (parentInstance === null) {
+      // Suspending at the root is not attributed to any particular component
+      // TODO: It should be attributed to the shell.
+      return;
+    }
+    const suspendedBy = parentInstance.suspendedBy;
+    if (suspendedBy === null) {
+      parentInstance.suspendedBy = [asyncInfo];
+    } else if (suspendedBy.indexOf(asyncInfo) === -1) {
+      suspendedBy.push(asyncInfo);
+    }
+  }
+
   function insertChild(instance: DevToolsInstance): void {
     const parentInstance = reconcilingParent;
     if (parentInstance === null) {
@@ -2515,6 +2543,17 @@ export function attach(
       if (fiber._debugInfo) {
         for (let i = 0; i < fiber._debugInfo.length; i++) {
           const debugEntry = fiber._debugInfo[i];
+          if (debugEntry.awaited) {
+            // Async Info
+            const asyncInfo: ReactAsyncInfo = (debugEntry: any);
+            if (level === virtualLevel) {
+              // Track any async info between the previous virtual instance up until to this
+              // instance and add it to the parent. This can add the same set multiple times
+              // so we assume insertSuspendedBy dedupes.
+              insertSuspendedBy(asyncInfo);
+            }
+            if (previousVirtualInstance) continue;
+          }
           if (typeof debugEntry.name !== 'string') {
             // Not a Component. Some other Debug Info.
             continue;
@@ -2768,6 +2807,7 @@ export function attach(
     // Move all the children of this instance to the remaining set.
     remainingReconcilingChildren = instance.firstChild;
     instance.firstChild = null;
+    instance.suspendedBy = null;
     try {
       // Unmount the remaining set.
       unmountRemainingChildren();
@@ -2968,6 +3008,7 @@ export function attach(
     // We'll move them back one by one, and anything that remains is deleted.
     remainingReconcilingChildren = virtualInstance.firstChild;
     virtualInstance.firstChild = null;
+    virtualInstance.suspendedBy = null;
     try {
       if (
         updateVirtualChildrenRecursively(
@@ -3019,6 +3060,17 @@ export function attach(
       if (nextChild._debugInfo) {
         for (let i = 0; i < nextChild._debugInfo.length; i++) {
           const debugEntry = nextChild._debugInfo[i];
+          if (debugEntry.awaited) {
+            // Async Info
+            const asyncInfo: ReactAsyncInfo = (debugEntry: any);
+            if (level === virtualLevel) {
+              // Track any async info between the previous virtual instance up until to this
+              // instance and add it to the parent. This can add the same set multiple times
+              // so we assume insertSuspendedBy dedupes.
+              insertSuspendedBy(asyncInfo);
+            }
+            if (previousVirtualInstance) continue;
+          }
           if (typeof debugEntry.name !== 'string') {
             // Not a Component. Some other Debug Info.
             continue;
@@ -3343,6 +3395,7 @@ export function attach(
       // We'll move them back one by one, and anything that remains is deleted.
       remainingReconcilingChildren = fiberInstance.firstChild;
       fiberInstance.firstChild = null;
+      fiberInstance.suspendedBy = null;
     }
     try {
       if (
@@ -4051,6 +4104,59 @@ export function attach(
     return null;
   }
 
+  function serializeAsyncInfo(
+    asyncInfo: ReactAsyncInfo,
+    index: number,
+    parentInstance: DevToolsInstance,
+  ): SerializedAsyncInfo {
+    const ioInfo = asyncInfo.awaited;
+    const ioOwnerInstance = findNearestOwnerInstance(
+      parentInstance,
+      ioInfo.owner,
+    );
+    const awaitOwnerInstance = findNearestOwnerInstance(
+      parentInstance,
+      asyncInfo.owner,
+    );
+    const value: any = ioInfo.value;
+    let resolvedValue = undefined;
+    if (
+      typeof value === 'object' &&
+      value !== null &&
+      typeof value.then === 'function'
+    ) {
+      switch (value.status) {
+        case 'fulfilled':
+          resolvedValue = value.value;
+          break;
+        case 'rejected':
+          resolvedValue = value.reason;
+          break;
+      }
+    }
+    return {
+      awaited: {
+        name: ioInfo.name,
+        description: getIODescription(resolvedValue),
+        start: ioInfo.start,
+        end: ioInfo.end,
+        value: ioInfo.value == null ? null : ioInfo.value,
+        env: ioInfo.env == null ? null : ioInfo.env,
+        owner:
+          ioOwnerInstance === null
+            ? null
+            : instanceToSerializedElement(ioOwnerInstance),
+        stack: ioInfo.stack == null ? null : ioInfo.stack,
+      },
+      env: asyncInfo.env == null ? null : asyncInfo.env,
+      owner:
+        awaitOwnerInstance === null
+          ? null
+          : instanceToSerializedElement(awaitOwnerInstance),
+      stack: asyncInfo.stack == null ? null : asyncInfo.stack,
+    };
+  }
+
   // Fast path props lookup for React Native style editor.
   // Could use inspectElementRaw() but that would require shallow rendering hooks components,
   // and could also mess with memoization.
@@ -4342,6 +4448,13 @@ export function attach(
       nativeTag = getNativeTag(fiber.stateNode);
     }
 
+    // This set is an edge case where if you pass a promise to a Client Component into a children
+    // position without a Server Component as the direct parent. E.g. <div>{promise}</div>
+    // In this case, this becomes associated with the Client/Host Component where as normally
+    // you'd expect these to be associated with the Server Component that awaited the data.
+    // TODO: Prepend other suspense sources like css, images and use().
+    const suspendedBy = fiberInstance.suspendedBy;
+
     return {
       id: fiberInstance.id,
 
@@ -4374,8 +4487,6 @@ export function attach(
           (fiber.alternate !== null &&
             forceFallbackForFibers.has(fiber.alternate))),
 
-      // Can view component source location.
-      canViewSource,
       source,
 
       // Does the component have legacy context attached to it.
@@ -4400,6 +4511,13 @@ export function attach(
           ? []
           : Array.from(componentLogsEntry.warnings.entries()),
 
+      suspendedBy:
+        suspendedBy === null
+          ? []
+          : suspendedBy.map((info, index) =>
+              serializeAsyncInfo(info, index, fiberInstance),
+            ),
+
       // List of owners
       owners,
 
@@ -4416,7 +4534,6 @@ export function attach(
   function inspectVirtualInstanceRaw(
     virtualInstance: VirtualInstance,
   ): InspectedElement | null {
-    const canViewSource = true;
     const source = getSourceForInstance(virtualInstance);
 
     const componentInfo = virtualInstance.data;
@@ -4454,6 +4571,9 @@ export function attach(
     const componentLogsEntry =
       componentInfoToComponentLogsMap.get(componentInfo);
 
+    // Things that Suspended this Server Component (use(), awaits and direct child promises)
+    const suspendedBy = virtualInstance.suspendedBy;
+
     return {
       id: virtualInstance.id,
 
@@ -4470,8 +4590,6 @@ export function attach(
 
       canToggleSuspense: supportsTogglingSuspense && hasSuspenseBoundary,
 
-      // Can view component source location.
-      canViewSource,
       source,
 
       // Does the component have legacy context attached to it.
@@ -4495,6 +4613,14 @@ export function attach(
         componentLogsEntry === undefined
           ? []
           : Array.from(componentLogsEntry.warnings.entries()),
+
+      suspendedBy:
+        suspendedBy === null
+          ? []
+          : suspendedBy.map((info, index) =>
+              serializeAsyncInfo(info, index, virtualInstance),
+            ),
+
       // List of owners
       owners,
 
@@ -4539,7 +4665,7 @@ export function attach(
 
   function createIsPathAllowed(
     key: string | null,
-    secondaryCategory: 'hooks' | null,
+    secondaryCategory: 'suspendedBy' | 'hooks' | null,
   ) {
     // This function helps prevent previously-inspected paths from being dehydrated in updates.
     // This is important to avoid a bad user experience where expanded toggles collapse on update.
@@ -4568,6 +4694,13 @@ export function attach(
             // Dehydrating the 'subHooks' property makes the HooksTree UI a lot more complicated,
             // so it's easiest for now if we just don't break on this boundary.
             // We can always dehydrate a level deeper (in the value object).
+            return true;
+          }
+          break;
+        case 'suspendedBy':
+          if (path.length < 5) {
+            // Never dehydrate anything above suspendedBy[index].awaited.value
+            // Those are part of the internal meta data. We only dehydrate inside the Promise.
             return true;
           }
           break;
@@ -4794,35 +4927,41 @@ export function attach(
         type: 'not-found',
       };
     }
+    const inspectedElement = mostRecentlyInspectedElement;
 
     // Any time an inspected element has an update,
     // we should update the selected $r value as wel.
     // Do this before dehydration (cleanForBridge).
-    updateSelectedElement(mostRecentlyInspectedElement);
+    updateSelectedElement(inspectedElement);
 
     // Clone before cleaning so that we preserve the full data.
     // This will enable us to send patches without re-inspecting if hydrated paths are requested.
     // (Reducing how often we shallow-render is a better DX for function components that use hooks.)
-    const cleanedInspectedElement = {...mostRecentlyInspectedElement};
+    const cleanedInspectedElement = {...inspectedElement};
     // $FlowFixMe[prop-missing] found when upgrading Flow
     cleanedInspectedElement.context = cleanForBridge(
-      cleanedInspectedElement.context,
+      inspectedElement.context,
       createIsPathAllowed('context', null),
     );
     // $FlowFixMe[prop-missing] found when upgrading Flow
     cleanedInspectedElement.hooks = cleanForBridge(
-      cleanedInspectedElement.hooks,
+      inspectedElement.hooks,
       createIsPathAllowed('hooks', 'hooks'),
     );
     // $FlowFixMe[prop-missing] found when upgrading Flow
     cleanedInspectedElement.props = cleanForBridge(
-      cleanedInspectedElement.props,
+      inspectedElement.props,
       createIsPathAllowed('props', null),
     );
     // $FlowFixMe[prop-missing] found when upgrading Flow
     cleanedInspectedElement.state = cleanForBridge(
-      cleanedInspectedElement.state,
+      inspectedElement.state,
       createIsPathAllowed('state', null),
+    );
+    // $FlowFixMe[prop-missing] found when upgrading Flow
+    cleanedInspectedElement.suspendedBy = cleanForBridge(
+      inspectedElement.suspendedBy,
+      createIsPathAllowed('suspendedBy', 'suspendedBy'),
     );
 
     return {
@@ -5805,7 +5944,7 @@ export function attach(
 
   function getSourceForFiberInstance(
     fiberInstance: FiberInstance,
-  ): Source | null {
+  ): ReactFunctionLocation | null {
     // Favor the owner source if we have one.
     const ownerSource = getSourceForInstance(fiberInstance);
     if (ownerSource !== null) {
@@ -5830,12 +5969,22 @@ export function attach(
     return source;
   }
 
-  function getSourceForInstance(instance: DevToolsInstance): Source | null {
-    const unresolvedSource = instance.source;
+  function getSourceForInstance(
+    instance: DevToolsInstance,
+  ): ReactFunctionLocation | null {
+    let unresolvedSource = instance.source;
     if (unresolvedSource === null) {
       // We don't have any source yet. We can try again later in case an owned child mounts later.
       // TODO: We won't have any information here if the child is filtered.
       return null;
+    }
+
+    if (instance.kind === VIRTUAL_INSTANCE) {
+      // We might have found one on the virtual instance.
+      const debugLocation = instance.data.debugLocation;
+      if (debugLocation != null) {
+        unresolvedSource = debugLocation;
+      }
     }
 
     // If we have the debug stack (the creation stack of the JSX) for any owned child of this
@@ -5857,6 +6006,86 @@ export function attach(
 
     // $FlowFixMe: refined.
     return unresolvedSource;
+  }
+
+  type InternalMcpFunctions = {
+    __internal_only_getComponentTree?: Function,
+  };
+
+  const internalMcpFunctions: InternalMcpFunctions = {};
+  if (__IS_INTERNAL_MCP_BUILD__) {
+    // eslint-disable-next-line no-inner-declarations
+    function __internal_only_getComponentTree(): string {
+      let treeString = '';
+
+      function buildTreeString(
+        instance: DevToolsInstance,
+        prefix: string = '',
+        isLastChild: boolean = true,
+      ): void {
+        if (!instance) return;
+
+        const name =
+          (instance.kind !== VIRTUAL_INSTANCE
+            ? getDisplayNameForFiber(instance.data)
+            : instance.data.name) || 'Unknown';
+
+        const id = instance.id !== undefined ? instance.id : 'unknown';
+
+        if (name !== 'createRoot()') {
+          treeString +=
+            prefix +
+            (isLastChild ? '└── ' : '├── ') +
+            name +
+            ' (id: ' +
+            id +
+            ')\n';
+        }
+
+        const childPrefix = prefix + (isLastChild ? '    ' : '│   ');
+
+        let childCount = 0;
+        let tempChild = instance.firstChild;
+        while (tempChild !== null) {
+          childCount++;
+          tempChild = tempChild.nextSibling;
+        }
+
+        let child = instance.firstChild;
+        let currentChildIndex = 0;
+
+        while (child !== null) {
+          currentChildIndex++;
+          const isLastSibling = currentChildIndex === childCount;
+          buildTreeString(child, childPrefix, isLastSibling);
+          child = child.nextSibling;
+        }
+      }
+
+      const rootInstances: Array<DevToolsInstance> = [];
+      idToDevToolsInstanceMap.forEach(instance => {
+        if (instance.parent === null || instance.parent.parent === null) {
+          rootInstances.push(instance);
+        }
+      });
+
+      if (rootInstances.length > 0) {
+        for (let i = 0; i < rootInstances.length; i++) {
+          const isLast = i === rootInstances.length - 1;
+          buildTreeString(rootInstances[i], '', isLast);
+          if (!isLast) {
+            treeString += '\n';
+          }
+        }
+      } else {
+        treeString = 'No component tree found.';
+      }
+
+      return treeString;
+    }
+
+    internalMcpFunctions.__internal_only_getComponentTree =
+      __internal_only_getComponentTree;
   }
 
   return {
@@ -5898,5 +6127,6 @@ export function attach(
     storeAsGlobal,
     updateComponentFilters,
     getEnvironmentNames,
+    ...internalMcpFunctions,
   };
 }
